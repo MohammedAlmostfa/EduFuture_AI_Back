@@ -3,23 +3,24 @@
 namespace App\Mail;
 
 use Illuminate\Bus\Queueable;
-use Illuminate\Contracts\Queue\ShouldQueue;
+
 use Illuminate\Mail\Mailable;
-use Illuminate\Mail\Mailables\Content;
-use Illuminate\Mail\Mailables\Envelope;
+
 use Illuminate\Queue\SerializesModels;
 
 class SendForgetPasswordCodeMail extends Mailable
 {
     use Queueable, SerializesModels;
 
-    public $code;
+    private $code;
+    private $email;
     /**
      * Create a new message instance.
      */
-    public function __construct($code)
+    public function __construct($code, $email)
     {
         $this->code = $code;
+        $this->email = $email;
     }
     /**
      * Build the message.
@@ -27,9 +28,10 @@ class SendForgetPasswordCodeMail extends Mailable
     public function build()
     {
         return $this->subject('Verification Code')
-            ->view('emails.forget_passeod_code')
+            ->view('emails.forget_password_code')
             ->with([
                 'code' => $this->code,
+                'user' => ['email' => $this->email],
             ]);
     }
 }

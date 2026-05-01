@@ -32,7 +32,7 @@ class ForgetPasswordService
             });
 
             // Send the code to the user's email
-            Mail::to($email)->send(new SendForgetPasswordCodeMail($code));
+            Mail::to($email)->send(new SendForgetPasswordCodeMail($code, $email));
 
             return [
                 'status' => 200,
