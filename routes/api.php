@@ -3,6 +3,7 @@
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\Auth\ForgetPasswordController;
+use App\Http\Controllers\FileController;
 
 // 🔓 Public routes
 Route::post('/login', [AuthController::class, 'login']);
@@ -17,8 +18,14 @@ Route::post('/checkCode', [ForgetPasswordController::class, 'checkCode']);
 Route::post('/changePassword', [ForgetPasswordController::class, 'changePassword']);
 
 
-// 🔐 Protected routes (JWT required)
+// 📁 File routes (protected)
 Route::middleware('auth:api')->group(function () {
+
+    // Auth
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::post('/refresh', [AuthController::class, 'refresh']);
+
+    // 📂 File upload + processing
+    Route::post('/files/upload', [FileController::class, 'upload']);
+
 });

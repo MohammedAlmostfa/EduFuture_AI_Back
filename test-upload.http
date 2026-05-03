@@ -1,0 +1,11 @@
+### Test File Upload
+POST http://localhost:8000/api/files/upload
+Authorization: Bearer YOUR_JWT_TOKEN
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+
+------WebKitFormBoundary
+Content-Disposition: form-data; name="file"; filename="test.pdf"
+Content-Type: application/pdf
+
+< ./storage/app/public/test.pdf
+------WebKitFormBoundary--
