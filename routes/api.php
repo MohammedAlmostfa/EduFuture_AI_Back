@@ -4,6 +4,7 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\Auth\ForgetPasswordController;
 use App\Http\Controllers\FileController;
+use App\Http\Controllers\LectureAnalysisController;
 
 // 🔓 Public routes
 Route::post('/login', [AuthController::class, 'login']);
@@ -25,7 +26,8 @@ Route::middleware('auth:api')->group(function () {
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::post('/refresh', [AuthController::class, 'refresh']);
 
-    // 📂 File upload + processing
-    Route::post('/files/upload', [FileController::class, 'upload']);
+
+
 
 });
+Route::post('/analyze-lecture', [LectureAnalysisController::class, 'uploadAndAnalyze']);

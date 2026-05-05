@@ -4,4 +4,4 @@ namespace App\Exceptions;
 
 use Exception;
 
-class AIAnalysisException extends Exception {}
+class ExtractionException extends Exception {}

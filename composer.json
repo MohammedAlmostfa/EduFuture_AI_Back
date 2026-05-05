@@ -7,9 +7,12 @@
     "license": "MIT",
     "require": {
         "php": "^8.3",
+        "illuminate/cache": "*",
+        "illuminate/http": "*",
         "laravel/framework": "^13.0",
         "laravel/sanctum": "^4.0",
         "laravel/tinker": "^3.0",
+        "phpoffice/phpword": "*",
         "smalot/pdfparser": "^2.12",
         "tymon/jwt-auth": "*"
     },
