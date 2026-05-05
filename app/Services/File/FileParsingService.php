@@ -4,92 +4,182 @@ namespace App\Services\File;
 
 use Smalot\PdfParser\Parser;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Storage;
+use App\Exceptions\FileParsingException;
+use App\Helpers\FileHelper;
+use Throwable;
 
 class FileParsingService
 {
+    private const SUPPORTED_EXTENSIONS = ['pdf', 'txt', 'docx'];
+    private const TEXT_CHUNK_SIZE = 8192;
+    private const MAX_FILE_SIZE = 104857600;
+
+    private Parser $pdfParser;
+
+    public function __construct()
+    {
+        $this->pdfParser = new Parser();
+    }
+
     public function extractText(string $filePath): string
     {
-        Log::info('FileParsing: start', [
-            'file_path' => $filePath,
-        ]);
+        $startTime = microtime(true);
 
-        // ❌ بدل file_exists استخدم Storage check
-        if (!file_exists($filePath)) {
-            Log::error('FileParsing: file not found', [
+        try {
+            FileHelper::validateFile($filePath);
+            $extension = FileHelper::getFileExtension($filePath);
+
+            Log::info('FileParsing: Starting', [
                 'file_path' => $filePath,
+                'extension' => $extension,
+                'file_size' => filesize($filePath)
             ]);
 
-            throw new \Exception("الملف غير موجود: {$filePath}");
+            $text = match ($extension) {
+                'pdf' => $this->extractFromPDF($filePath),
+                'txt' => $this->extractFromTxt($filePath),
+                'docx' => $this->extractFromDocx($filePath),
+            };
+
+            $cleanedText = FileHelper::cleanText($text);
+
+            Log::info('FileParsing: Completed', [
+                'extension' => $extension,
+                'original_length' => strlen($text),
+                'cleaned_length' => strlen($cleanedText),
+                'execution_time' => round((microtime(true) - $startTime), 3) . 's'
+            ]);
+
+            return $cleanedText;
+
+        } catch (FileParsingException $e) {
+            Log::error('FileParsing: Validation Error', ['message' => $e->getMessage()]);
+            throw $e;
+        } catch (Throwable $e) {
+            Log::error('FileParsing: Critical Failure', [
+                'message' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine()
+            ]);
+            throw new FileParsingException('Failed to parse file: ' . $e->getMessage(), 0, $e);
         }
-
-        $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-
-        Log::info('FileParsing: extension detected', [
-            'extension' => $extension,
-        ]);
-
-        return match ($extension) {
-            'pdf' => $this->extractFromPDF($filePath),
-            'txt' => $this->extractFromTxt($filePath),
-            default => throw new \Exception('صيغة الملف غير مدعومة حالياً: ' . $extension),
-        };
     }
 
     private function extractFromPDF(string $filePath): string
     {
-        Log::info('FileParsing: PDF extraction started');
+        try {
+            $pdf = $this->pdfParser->parseFile($filePath);
 
-        $parser = new Parser();
-        $pdf = $parser->parseFile($filePath);
+            if (!$pdf) {
+                throw new FileParsingException('Failed to parse PDF file');
+            }
 
-        $text = '';
+            $text = '';
+            $pageCount = 0;
 
-        foreach ($pdf->getPages() as $page) {
-            $text .= $page->getText() . ' ';
+            foreach ($pdf->getPages() as $page) {
+                try {
+                    $pageText = $page->getText();
+                    if (!empty($pageText)) {
+                        $text .= $pageText . ' ';
+                        $pageCount++;
+                    }
+                } catch (Throwable $e) {
+                    Log::warning('FileParsing: Page extraction failed', [
+                        'page' => $pageCount + 1,
+                        'error' => $e->getMessage()
+                    ]);
+                    continue;
+                }
+            }
+
+            if (empty($text)) {
+                throw new FileParsingException('PDF contains no extractable text');
+            }
+
+            Log::info('FileParsing: PDF extraction completed', [
+                'pages' => $pageCount,
+                'text_length' => strlen($text)
+            ]);
+
+            return $text;
+
+        } catch (Throwable $e) {
+            throw new FileParsingException('PDF parsing failed: ' . $e->getMessage(), 0, $e);
         }
-
-        Log::info('FileParsing: PDF extraction completed', [
-            'length' => strlen($text),
-        ]);
-
-        return $this->cleanText($text);
     }
 
     private function extractFromTxt(string $filePath): string
     {
-        Log::info('FileParsing: TXT extraction started');
+        try {
+            $text = '';
+            $handle = fopen($filePath, 'r');
 
-        $text = file_get_contents($filePath);
+            if ($handle === false) {
+                throw new FileParsingException('Failed to open TXT file');
+            }
 
-        if ($text === false) {
+            while (!feof($handle)) {
+                $chunk = fread($handle, self::TEXT_CHUNK_SIZE);
+                if ($chunk === false) {
+                    fclose($handle);
+                    throw new FileParsingException('Failed to read TXT file');
+                }
+                $text .= $chunk;
+            }
 
-            Log::error('FileParsing: TXT read failed', [
-                'file_path' => $filePath,
+            fclose($handle);
+
+            if (empty($text)) {
+                throw new FileParsingException('TXT file is empty');
+            }
+
+            Log::info('FileParsing: TXT extraction completed', [
+                'text_length' => strlen($text)
             ]);
 
-            throw new \Exception('فشل قراءة ملف TXT');
+            return $text;
+
+        } catch (FileParsingException $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            throw new FileParsingException('TXT parsing failed: ' . $e->getMessage(), 0, $e);
         }
-
-        Log::info('FileParsing: TXT extraction completed', [
-            'length' => strlen($text),
-        ]);
-
-        return $this->cleanText($text);
     }
 
-    private function cleanText(string $text): string
+    private function extractFromDocx(string $filePath): string
     {
-        $before = strlen($text);
+        try {
+            $zip = new \ZipArchive();
+            $result = $zip->open($filePath);
 
-        $text = preg_replace('/\s+/u', ' ', $text);
-        $text = trim($text);
+            if ($result !== true) {
+                throw new FileParsingException("Failed to open DOCX file: {$result}");
+            }
 
-        Log::info('FileParsing: text cleaned', [
-            'before' => $before,
-            'after' => strlen($text),
-        ]);
+            $xmlContent = $zip->getFromName('word/document.xml');
+            $zip->close();
 
-        return $text;
+            if ($xmlContent === false) {
+                throw new FileParsingException('DOCX file does not contain valid document.xml');
+            }
+
+            $text = FileHelper::extractTextFromDocxXml($xmlContent);
+
+            if (empty($text)) {
+                throw new FileParsingException('DOCX contains no extractable text');
+            }
+
+            Log::info('FileParsing: DOCX extraction completed', [
+                'text_length' => strlen($text)
+            ]);
+
+            return $text;
+
+        } catch (FileParsingException $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            throw new FileParsingException('DOCX parsing failed: ' . $e->getMessage(), 0, $e);
+        }
     }
 }

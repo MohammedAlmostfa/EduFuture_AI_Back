@@ -7,13 +7,18 @@ use App\Models\AnalysisResult;
 use App\Services\File\FileParsingService;
 use App\Services\File\TextChunkingService;
 use App\Services\File\AIAnalysisService;
+use App\Events\FileProcessingStarted;
+use App\Events\FileProcessingCompleted;
+use App\Events\FileProcessingFailed;
 use Illuminate\Bus\Queueable;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Throwable;
 
 class ProcessFileJob implements ShouldQueue
 {
@@ -21,127 +26,307 @@ class ProcessFileJob implements ShouldQueue
 
     public $timeout = 3600;
     public $tries = 3;
+    public $backoff = [60, 300, 900];
+    public $maxExceptions = 3;
 
-    public function __construct(public File $file)
-    {}
+    public File $file;
+    private FileParsingService $parsingService;
+    private TextChunkingService $chunkingService;
+    private AIAnalysisService $analysisService;
 
-    public function handle()
+    public function __construct(File $file)
     {
-        Log::info('ProcessFileJob started', [
+        $this->file = $file;
+        $this->onQueue('files');
+    }
+
+    public function handle(): void
+    {
+        Log::info('ProcessFileJob: Starting', [
             'file_id' => $this->file->id,
-            'path' => $this->file->path
+            'user_id' => $this->file->user_id,
+            'file_name' => $this->file->name,
+            'file_size' => $this->file->size
         ]);
 
-        try {
-            // Step 0: update status
-            $this->file->update([
-                'status' => 'processing'
-            ]);
+        $startTime = microtime(true);
 
-            Log::info('File status updated to processing', [
-                'file_id' => $this->file->id
-            ]);
+        try {
+            $this->initializeServices();
+            $this->updateFileStatus('processing');
+            event(new FileProcessingStarted($this->file));
 
             // Step 1: Extract text
-            Log::info('Starting text extraction', [
-                'file_id' => $this->file->id
+            Log::info('ProcessFileJob: Step 1 - Text Extraction', ['file_id' => $this->file->id]);
+            $extractedText = $this->extractText();
+
+            // Step 2: Chunk text
+            Log::info('ProcessFileJob: Step 2 - Text Chunking', [
+                'file_id' => $this->file->id,
+                'text_length' => strlen($extractedText)
+            ]);
+            $chunks = $this->chunkText($extractedText);
+
+            // Step 3: Analyze chunks
+            Log::info('ProcessFileJob: Step 3 - AI Analysis', [
+                'file_id' => $this->file->id,
+                'chunks_count' => count($chunks)
+            ]);
+            $this->analyzeChunks($chunks);
+
+            // Step 4: Complete
+            $this->updateFileStatus('completed');
+            event(new FileProcessingCompleted($this->file));
+
+            Log::info('ProcessFileJob: Completed successfully', [
+                'file_id' => $this->file->id,
+                'execution_time' => round((microtime(true) - $startTime), 2) . 's',
+                'chunks_processed' => count($chunks)
             ]);
 
-            $fileParsingService = new FileParsingService();
+        } catch (Throwable $e) {
+            $this->handleJobFailure($e, $startTime);
+        }
+    }
 
-            // ✅ FIX: correct storage access (NO str_replace, NO storage_path)
+    private function initializeServices(): void
+    {
+        $this->parsingService = new FileParsingService();
+        $this->chunkingService = new TextChunkingService();
+        $this->analysisService = new AIAnalysisService();
+    }
+
+    private function extractText(): string
+    {
+        try {
             $filePath = Storage::disk('private')->path($this->file->path);
 
-            Log::info('Resolved file path', [
-                'file_path' => $filePath,
+            Log::info('ProcessFileJob: Resolving file path', [
+                'file_id' => $this->file->id,
+                'path' => $filePath,
                 'exists' => file_exists($filePath)
             ]);
 
-            // optional safety check
             if (!file_exists($filePath)) {
-                throw new \Exception("File not found: " . $filePath);
+                throw new \Exception("File not found: {$filePath}");
             }
 
-            $extractedText = $fileParsingService->extractText($filePath);
+            $extractedText = $this->parsingService->extractText($filePath);
 
-            Log::info('Text extraction completed', [
+            if (empty($extractedText)) {
+                throw new \Exception('File contains no extractable text');
+            }
+
+            $this->file->update([
+                'extracted_text' => $extractedText
+            ]);
+
+            Log::info('ProcessFileJob: Text extracted', [
                 'file_id' => $this->file->id,
                 'text_length' => strlen($extractedText)
             ]);
 
-            $this->file->update([
-                'extracted_text' => $extractedText,
-            ]);
+            return $extractedText;
 
-            // Step 2: Chunking
-            Log::info('Starting text chunking', [
-                'file_id' => $this->file->id
-            ]);
-
-            $chunkingService = new TextChunkingService();
-            $chunks = $chunkingService->chunk($extractedText, 2000);
-
-            Log::info('Chunking completed', [
+        } catch (Throwable $e) {
+            Log::error('ProcessFileJob: Text extraction failed', [
                 'file_id' => $this->file->id,
-                'chunks_count' => count($chunks)
+                'error' => $e->getMessage()
             ]);
-
-            // Step 3: AI Analysis
-            Log::info('Starting AI analysis', [
-                'file_id' => $this->file->id
-            ]);
-
-            $aiService = new AIAnalysisService();
-
-            foreach ($chunks as $index => $chunk) {
-
-                Log::info('Analyzing chunk', [
-                    'file_id' => $this->file->id,
-                    'chunk_index' => $index,
-                    'chunk_length' => strlen($chunk)
-                ]);
-
-                $analysis = $aiService->analyzeChunk($chunk);
-
-                AnalysisResult::create([
-                    'file_id' => $this->file->id,
-                    'chunk_index' => $index,
-                    'simple_explanation' => $analysis['simple_explanation'] ?? null,
-                    'key_ideas' => json_encode($analysis['key_ideas'] ?? []),
-                    'historical_context' => $analysis['historical_context'] ?? null,
-                    'market_usage' => $analysis['market_usage'] ?? null,
-                    'related_jobs' => json_encode($analysis['related_jobs'] ?? [])
-                ]);
-
-                Log::info('Chunk processed', [
-                    'file_id' => $this->file->id,
-                    'chunk_index' => $index
-                ]);
-            }
-
-            // Finish
-            $this->file->update([
-                'status' => 'completed'
-            ]);
-
-            Log::info('ProcessFileJob completed successfully', [
-                'file_id' => $this->file->id
-            ]);
-
-        } catch (\Throwable $e) {
-
-            $this->file->update([
-                'status' => 'failed',
-                'error_message' => $e->getMessage()
-            ]);
-
-            Log::error('ProcessFileJob failed', [
-                'file_id' => $this->file->id,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
-            ]);
-
             throw $e;
         }
+    }
+
+    private function chunkText(string $text): array
+    {
+        try {
+            $chunks = strpos($text, "\n") !== false
+                ? $this->chunkingService->chunkSmart($text)
+                : $this->chunkingService->chunk($text);
+
+            if (empty($chunks)) {
+                throw new \Exception('Failed to chunk text');
+            }
+
+            $stats = $this->chunkingService->getChunkingStats($chunks);
+
+            Log::info('ProcessFileJob: Text chunked', [
+                'file_id' => $this->file->id,
+                'chunks' => $stats['total_chunks'],
+                'total_words' => $stats['total_words'],
+                'average' => $stats['average_words_per_chunk']
+            ]);
+
+            return $chunks;
+
+        } catch (Throwable $e) {
+            Log::error('ProcessFileJob: Text chunking failed', [
+                'file_id' => $this->file->id,
+                'error' => $e->getMessage()
+            ]);
+            throw $e;
+        }
+    }
+
+    private function analyzeChunks(array $chunks): void
+    {
+        $totalChunks = count($chunks);
+        $successCount = 0;
+        $failureCount = 0;
+
+        DB::beginTransaction();
+
+        try {
+            foreach ($chunks as $index => $chunk) {
+                $chunkNumber = $index + 1;
+
+                try {
+                    Log::info('ProcessFileJob: Analyzing chunk', [
+                        'file_id' => $this->file->id,
+                        'chunk' => "{$chunkNumber}/{$totalChunks}",
+                        'chunk_length' => strlen($chunk)
+                    ]);
+
+                    $analysis = $this->analysisService->analyzeChunk($chunk, [
+                        'file_id' => $this->file->id,
+                        'chunk_index' => $index
+                    ]);
+
+                    AnalysisResult::create([
+                        'file_id' => $this->file->id,
+                        'chunk_index' => $index,
+                        'chunk_text' => $chunk,
+                        'simple_explanation' => $analysis['simple_explanation'] ?? null,
+                        'key_ideas' => json_encode($analysis['key_ideas'] ?? [], JSON_UNESCAPED_UNICODE),
+                        'historical_context' => $analysis['historical_context'] ?? null,
+                        'market_usage' => $analysis['market_usage'] ?? null,
+                        'related_jobs' => json_encode($analysis['related_jobs'] ?? [], JSON_UNESCAPED_UNICODE),
+                        'analyzed_at' => now()
+                    ]);
+
+                    $successCount++;
+
+                    Log::info('ProcessFileJob: Chunk analyzed', [
+                        'file_id' => $this->file->id,
+                        'chunk' => "{$chunkNumber}/{$totalChunks}",
+                        'success_rate' => round(($successCount / $chunkNumber) * 100, 2) . '%'
+                    ]);
+
+                } catch (Throwable $e) {
+                    $failureCount++;
+
+                    Log::warning('ProcessFileJob: Chunk analysis failed, continuing', [
+                        'file_id' => $this->file->id,
+                        'chunk' => "{$chunkNumber}/{$totalChunks}",
+                        'error' => $e->getMessage()
+                    ]);
+
+                    continue;
+                }
+            }
+
+            DB::commit();
+
+            $this->file->update([
+                'chunks_total' => $totalChunks,
+                'chunks_processed' => $successCount,
+                'chunks_failed' => $failureCount
+            ]);
+
+            Log::info('ProcessFileJob: Analysis summary', [
+                'file_id' => $this->file->id,
+                'total' => $totalChunks,
+                'success' => $successCount,
+                'failure' => $failureCount,
+                'success_rate' => round(($successCount / $totalChunks) * 100, 2) . '%'
+            ]);
+
+            if ($failureCount > ($totalChunks * 0.5)) {
+                throw new \Exception(
+                    "More than 50% of chunks failed to analyze ({$failureCount}/{$totalChunks})"
+                );
+            }
+
+        } catch (Throwable $e) {
+            DB::rollBack();
+            Log::error('ProcessFileJob: Analysis transaction failed', [
+                'file_id' => $this->file->id,
+                'error' => $e->getMessage()
+            ]);
+            throw $e;
+        }
+    }
+
+    private function updateFileStatus(string $status, ?string $errorMessage = null): void
+    {
+        try {
+            $this->file->update([
+                'status' => $status,
+                'error_message' => $errorMessage
+            ]);
+
+            Log::info('ProcessFileJob: Status updated', [
+                'file_id' => $this->file->id,
+                'status' => $status
+            ]);
+
+        } catch (Throwable $e) {
+            Log::error('ProcessFileJob: Failed to update status', [
+                'file_id' => $this->file->id,
+                'error' => $e->getMessage()
+            ]);
+        }
+    }
+
+    private function handleJobFailure(Throwable $e, float $startTime): void
+    {
+        $errorMessage = $e->getMessage();
+        $executionTime = round((microtime(true) - $startTime), 2);
+
+        Log::error('ProcessFileJob: Failed', [
+            'file_id' => $this->file->id,
+            'attempt' => $this->attempts(),
+            'max_attempts' => $this->tries,
+            'error' => $errorMessage,
+            'execution_time' => $executionTime . 's'
+        ]);
+
+        $this->updateFileStatus('failed', $errorMessage);
+        event(new FileProcessingFailed($this->file, $e));
+
+        if ($this->attempts() >= $this->tries) {
+            Log::error('ProcessFileJob: Exhausted all retries', [
+                'file_id' => $this->file->id,
+                'total_attempts' => $this->attempts()
+            ]);
+        }
+
+        throw $e;
+    }
+
+    public function failed(Throwable $e): void
+    {
+        Log::critical('ProcessFileJob: Permanently failed', [
+            'file_id' => $this->file->id,
+            'final_error' => $e->getMessage(),
+            'total_attempts' => $this->attempts()
+        ]);
+
+        $this->file->update([
+            'status' => 'failed',
+            'error_message' => 'Processing failed after ' . $this->tries . ' attempts'
+        ]);
+
+        event(new FileProcessingFailed($this->file, $e));
+    }
+
+    public function timeout(): void
+    {
+        Log::warning('ProcessFileJob: Timeout', [
+            'file_id' => $this->file->id,
+            'timeout' => $this->timeout
+        ]);
+
+        $this->updateFileStatus('failed', 'Processing timeout');
     }
 }

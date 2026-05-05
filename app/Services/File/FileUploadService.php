@@ -6,72 +6,161 @@ use App\Jobs\ProcessFileJob;
 use App\Models\File;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Http\UploadedFile;
+use App\Exceptions\FileUploadException;
+use App\Helpers\FileHelper;
+use Throwable;
 
 class FileUploadService
 {
-    public function upload($file)
+    private const ALLOWED_MIME_TYPES = [
+        'pdf' => 'application/pdf',
+        'txt' => 'text/plain',
+        'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    ];
+    private const MAX_FILE_SIZE = 104857600; // 100 MB
+
+    public function upload(UploadedFile $uploadedFile): array
     {
+        $userId = auth()->id();
+        $startTime = microtime(true);
+
+        DB::beginTransaction();
+
         try {
-            DB::beginTransaction();
+            $this->validateUploadedFile($uploadedFile);
 
-            // 🔥 التخزين الصحيح داخل disk = private
-            $path = $file->store('files', 'private');
+            Log::info('FileUpload: Starting', [
+                'user_id' => $userId,
+                'original_name' => $uploadedFile->getClientOriginalName(),
+                'size' => $uploadedFile->getSize()
+            ]);
 
-            Log::info('File stored successfully', [
+            // Store file
+            $path = FileHelper::storeFile($uploadedFile, $userId);
+
+            // Create database record
+            $file = File::create([
+                'name' => FileHelper::sanitizeFileName($uploadedFile->getClientOriginalName()),
                 'path' => $path,
-                'disk' => 'private',
+                'size' => $uploadedFile->getSize(),
+                'type' => $uploadedFile->getClientMimeType(),
+                'extension' => strtolower($uploadedFile->getClientOriginalExtension()),
+                'user_id' => $userId,
+                'status' => 'pending',
+                'checksum' => FileHelper::generateFileChecksum($uploadedFile),
             ]);
 
-            // إنشاء سجل في قاعدة البيانات
-            $uploadedFile = File::create([
-                'name' => $file->getClientOriginalName(),
-                'path' => $path,
-                'size' => $file->getSize(),
-                'type' => $file->getClientMimeType(),
-                'user_id' => auth()->id(),
+            Log::info('FileUpload: File record created', [
+                'file_id' => $file->id,
+                'path' => $file->path
             ]);
 
-            Log::info('File record created', [
-                'file_id' => $uploadedFile->id,
-                'path' => $uploadedFile->path,
-            ]);
+            // Dispatch processing job
+            ProcessFileJob::dispatch($file)->onQueue('files');
 
-            // إرسال Job للمعالجة
-            ProcessFileJob::dispatch($uploadedFile)->onQueue('default');
-
-            Log::info('ProcessFileJob dispatched', [
-                'file_id' => $uploadedFile->id,
-                'queue' => 'default',
+            Log::info('FileUpload: Job dispatched', [
+                'file_id' => $file->id,
+                'queue' => 'files'
             ]);
 
             DB::commit();
 
-            Log::info('File upload completed successfully', [
-                'file_id' => $uploadedFile->id,
+            Log::info('FileUpload: Completed', [
+                'file_id' => $file->id,
+                'execution_time' => round((microtime(true) - $startTime), 3) . 's'
             ]);
 
             return [
                 'status' => 200,
-                'message' => 'تم رفع الملف بنجاح',
-                'data' => $uploadedFile
+                'message' => 'تم رفع الملف بنجاح وبدأ معالجته',
+                'data' => [
+                    'file_id' => $file->id,
+                    'name' => $file->name,
+                    'size' => $file->size,
+                    'status' => $file->status,
+                ]
             ];
 
-        } catch (\Throwable $e) {
-
+        } catch (FileUploadException $e) {
             DB::rollBack();
-
-            Log::error('File upload failed', [
+            Log::error('FileUpload: Validation Error', [
                 'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-                'user_id' => auth()->id(),
+                'code' => $e->getCode()
+            ]);
+
+            return [
+                'status' => 422,
+                'message' => 'خطأ في التحقق من الملف',
+                'error' => $e->getMessage(),
+                'data' => null
+            ];
+
+        } catch (Throwable $e) {
+            DB::rollBack();
+            Log::error('FileUpload: Critical Failure', [
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'user_id' => $userId,
             ]);
 
             return [
                 'status' => 500,
-                'message' => 'فشل رفع الملف',
-                'error' => $e->getMessage(),
+                'message' => 'حدث خطأ أثناء رفع الملف',
+                'error' => config('app.debug') ? $e->getMessage() : 'Internal Server Error',
                 'data' => null
             ];
         }
+    }
+
+    private function validateUploadedFile(UploadedFile $file): void
+    {
+        // Check file size
+        if ($file->getSize() > self::MAX_FILE_SIZE) {
+            throw new FileUploadException(
+                'حجم الملف يتجاوز الحد الأقصى (' . FileHelper::formatBytes($file->getSize()) . ')'
+            );
+        }
+
+        // Check extension
+        $extension = strtolower($file->getClientOriginalExtension());
+        if (!array_key_exists($extension, self::ALLOWED_MIME_TYPES)) {
+            throw new FileUploadException(
+                'نوع الملف غير مسموح. الأنواع المسموحة: ' . implode(', ', array_keys(self::ALLOWED_MIME_TYPES))
+            );
+        }
+
+        // Verify MIME type matches extension
+        $expectedMimeType = self::ALLOWED_MIME_TYPES[$extension];
+        $actualMimeType = $file->getClientMimeType();
+
+        if ($actualMimeType !== $expectedMimeType && !$this->isValidMimeVariant($extension, $actualMimeType)) {
+            Log::warning('FileUpload: MIME type mismatch', [
+                'extension' => $extension,
+                'expected' => $expectedMimeType,
+                'actual' => $actualMimeType
+            ]);
+        }
+    }
+
+    private function isValidMimeVariant(string $extension, string $mimeType): bool
+    {
+        $variants = [
+            'docx' => [
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                'application/octet-stream',
+            ],
+            'pdf' => [
+                'application/pdf',
+                'application/octet-stream',
+            ],
+            'txt' => [
+                'text/plain',
+                'application/octet-stream',
+            ],
+        ];
+
+        return in_array($mimeType, $variants[$extension] ?? [], true);
     }
 }

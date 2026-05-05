@@ -17,6 +17,8 @@ class AnalysisResult extends Model
         'historical_context',
         'market_usage',
         'related_jobs',
+        'chunk_text',
+        'analyzed_at',
     ];
 
     protected $casts = [
